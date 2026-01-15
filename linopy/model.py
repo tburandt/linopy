@@ -1270,11 +1270,12 @@ class Model:
             else:
                 solution_fn = self.get_solution_file()
 
-        if sanitize_zeros:
-            self.constraints.sanitize_zeros()
-
-        if sanitize_infinities:
-            self.constraints.sanitize_infinities()
+        if sanitize_zeros or sanitize_infinities:
+            self.constraints.sanitize(
+                zeros=sanitize_zeros,
+                missings=False,
+                infinities=sanitize_infinities,
+            )
 
         if self.is_quadratic and not solver_supports(
             solver_name, SolverFeature.QUADRATIC_OBJECTIVE

@@ -12,7 +12,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from itertools import product, zip_longest
+from itertools import product
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 from warnings import warn
 
@@ -22,7 +22,7 @@ import polars as pl
 import scipy
 import xarray as xr
 import xarray.core.groupby
-from numpy import array, nan, ndarray
+from numpy import nan, ndarray
 from pandas.core.frame import DataFrame
 from pandas.core.series import Series
 from scipy.sparse import csc_matrix
@@ -1568,11 +1568,38 @@ class LinearExpression(BaseExpression):
         shape = list(map(len, coords.values()))
 
         coeffs = array(tuple(zip_longest(*(e.coeffs for e in exprs), fillvalue=nan)))
-        vars = array(tuple(zip_longest(*(e.vars for e in exprs), fillvalue=-1)))
+        if n_exprs == 0:
+            # Handle empty case
+            coeffdata = DataArray(
+                np.array([]).reshape((0, *shape)), coords, dims=(TERM_DIM, *coords)
+            )
+            vardata = DataArray(
+                np.array([], dtype=np.int64).reshape((0, *shape)),
+                coords,
+                dims=(TERM_DIM, *coords),
+            )
+            ds = Dataset({"coeffs": coeffdata, "vars": vardata}).transpose(
+                ..., TERM_DIM
+            )
+            return cls(ds, model)
 
-        nterm = vars.shape[0]
-        coeffs = coeffs.reshape((nterm, *shape))
-        vars = vars.reshape((nterm, *shape))
+        # Find max term length in single pass
+        max_terms = max(len(e.vars) for e in exprs)
+
+        # Pre-allocate arrays with fill values
+        coeffs = np.full((max_terms, n_exprs), nan, dtype=np.float64)
+        vars = np.full((max_terms, n_exprs), -1, dtype=np.int64)
+
+        # Fill arrays using direct indexing (faster than zip_longest)
+        for i, expr in enumerate(exprs):
+            n = len(expr.vars)
+            if n > 0:
+                coeffs[:n, i] = expr.coeffs
+                vars[:n, i] = expr.vars
+
+        # Reshape to target shape
+        coeffs = coeffs.reshape((max_terms, *shape))
+        vars = vars.reshape((max_terms, *shape))
 
         coeffdata = DataArray(coeffs, coords, dims=(TERM_DIM, *coords))
         vardata = DataArray(vars, coords, dims=(TERM_DIM, *coords))

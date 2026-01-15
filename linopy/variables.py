@@ -1183,6 +1183,7 @@ class Variables:
     data: dict[str, Variable]
     model: Model
     _label_position_index: LabelPositionIndex | None = None
+    _label_to_key_array: ndarray | None = None
 
     dataset_attrs = ["labels", "lower", "upper"]
     dataset_names = ["Labels", "Lower bounds", "Upper bounds"]
@@ -1290,6 +1291,7 @@ class Variables:
         """Invalidate the label position index cache."""
         if self._label_position_index is not None:
             self._label_position_index.invalidate()
+        self._label_to_key_array = None
 
     @property
     def attrs(self) -> dict[Any, Any]:
@@ -1523,11 +1525,48 @@ class Variables:
         -------
         pd.DataFrame
         """
-        df = pd.concat([self[k].flat for k in self], ignore_index=True)
-        unique_labels = df.labels.unique()
-        map_labels = pd.Series(np.arange(len(unique_labels)), index=unique_labels)
-        df["key"] = df.labels.map(map_labels)
-        return df
+        if not len(self):
+            return pd.DataFrame(columns=["labels", "lower", "upper", "key"])
+
+        # Use polars for faster concatenation and processing
+        dfs_pl = [self[k].to_polars() for k in self]
+        df_pl = pl.concat(dfs_pl, how="diagonal_relaxed")
+
+        # Compute key mapping using polars (much faster than pandas for large datasets)
+        df_pl = df_pl.with_columns(
+            pl.col("labels").rank("dense").cast(pl.Int64).sub(1).alias("key")
+        )
+
+        # Convert to pandas at the end for API compatibility
+        return df_pl.to_pandas()
+
+    @property
+    def label_to_key_array(self) -> ndarray:
+        """
+        Get a numpy array for O(1) label-to-key lookup.
+
+        This is cached for repeated access during matrix building.
+        Uses numpy fancy indexing which is faster than pandas .map()
+        for large datasets.
+
+        The array has shape (max_label + 1,) where array[label] = key.
+        Labels not present in variables map to -1.
+
+        Returns
+        -------
+        np.ndarray
+            Array mapping label indices to compact key indices.
+        """
+        if self._label_to_key_array is None:
+            flat = self.flat
+            if len(flat) == 0:
+                self._label_to_key_array = np.array([], dtype=np.int64)
+            else:
+                max_label = flat["labels"].max()
+                mapping = np.full(max_label + 1, -1, dtype=np.int64)
+                mapping[flat["labels"].values] = flat["key"].values
+                self._label_to_key_array = mapping
+        return self._label_to_key_array
 
     def reset_solution(self) -> None:
         """

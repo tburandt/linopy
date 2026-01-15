@@ -698,6 +698,7 @@ class Constraints:
     data: dict[str, Constraint]
     model: Model
     _label_position_index: LabelPositionIndex | None = None
+    _label_to_key_array: ndarray | None = None
 
     dataset_attrs = ["labels", "coeffs", "vars", "sign", "rhs"]
     dataset_names = [
@@ -807,6 +808,7 @@ class Constraints:
         """Invalidate the label position index cache."""
         if self._label_position_index is not None:
             self._label_position_index.invalidate()
+        self._label_to_key_array = None
 
     @property
     def labels(self) -> Dataset:
@@ -927,34 +929,87 @@ class Constraints:
         """
         Filter out terms with zero and close-to-zero coefficient.
         """
-        for name in self:
-            not_zero = abs(self[name].coeffs) > 1e-10
-            con = self[name]
-            con.vars = self[name].vars.where(not_zero, -1)
-            con.coeffs = self[name].coeffs.where(not_zero)
+        self.sanitize(zeros=True, missings=False, infinities=False)
 
     def sanitize_missings(self) -> None:
         """
         Set constraints labels to -1 where all variables in the lhs are
         missing.
         """
-        for name in self:
-            con = self[name]
-            contains_non_missing = (con.vars != -1).any(con.term_dim)
-            labels = self[name].labels.where(contains_non_missing, -1)
-            con._data = assign_multiindex_safe(con.data, labels=labels)
+        self.sanitize(zeros=False, missings=True, infinities=False)
 
     def sanitize_infinities(self) -> None:
         """
         Replace infinite values in the constraints with a large value.
         """
+        self.sanitize(zeros=False, missings=False, infinities=True)
+
+    def sanitize(
+        self,
+        zeros: bool = True,
+        missings: bool = True,
+        infinities: bool = True,
+    ) -> None:
+        """
+        Sanitize constraints in a single pass over all constraint data.
+
+        This method combines zero filtering, missing value handling, and infinity
+        handling into one efficient iteration, reducing overhead compared to
+        calling each sanitization method separately.
+
+        Parameters
+        ----------
+        zeros : bool, optional
+            Filter terms with zero/near-zero coefficients (|coeff| <= 1e-10).
+            Default is True.
+        missings : bool, optional
+            Set labels to -1 where all variables in the lhs are missing.
+            Default is True.
+        infinities : bool, optional
+            Set labels to -1 for always-satisfied inequality constraints
+            (i.e., <= inf or >= -inf). Default is True.
+        """
+        if not (zeros or missings or infinities):
+            return
+
         for name in self:
             con = self[name]
-            valid_infinity_values = ((con.sign == LESS_EQUAL) & (con.rhs == np.inf)) | (
-                (con.sign == GREATER_EQUAL) & (con.rhs == -np.inf)
-            )
-            labels = con.labels.where(~valid_infinity_values, -1)
-            con._data = assign_multiindex_safe(con.data, labels=labels)
+
+            # Track what needs to be updated
+            new_vars = None
+            new_coeffs = None
+            new_labels = None
+
+            if zeros:
+                not_zero = abs(con.coeffs) > 1e-10
+                new_vars = con.vars.where(not_zero, -1)
+                new_coeffs = con.coeffs.where(not_zero)
+
+            if missings or infinities:
+                # Start with current labels
+                labels = con.labels
+
+                if missings:
+                    # Use updated vars if zeros was applied, else original
+                    vars_to_check = new_vars if new_vars is not None else con.vars
+                    contains_non_missing = (vars_to_check != -1).any(con.term_dim)
+                    labels = labels.where(contains_non_missing, -1)
+
+                if infinities:
+                    valid_infinity_values = (
+                        (con.sign == LESS_EQUAL) & (con.rhs == np.inf)
+                    ) | ((con.sign == GREATER_EQUAL) & (con.rhs == -np.inf))
+                    labels = labels.where(~valid_infinity_values, -1)
+
+                new_labels = labels
+
+            # Apply all updates in a single assignment
+            if zeros:
+                con.vars = new_vars
+                con.coeffs = new_coeffs
+
+            if new_labels is not None:
+                con._data = assign_multiindex_safe(con.data, labels=new_labels)
 
     def get_name_by_label(self, label: int | float) -> str:
         """
@@ -1059,14 +1114,48 @@ class Constraints:
         -------
         pd.DataFrame
         """
-        dfs = [self[k].flat for k in self]
-        if not len(dfs):
+        if not len(self):
             return pd.DataFrame(columns=["coeffs", "vars", "labels", "key"])
-        df = pd.concat(dfs, ignore_index=True)
-        unique_labels = df.labels.unique()
-        map_labels = pd.Series(np.arange(len(unique_labels)), index=unique_labels)
-        df["key"] = df.labels.map(map_labels)
-        return df
+
+        # Use polars for faster concatenation and processing
+        dfs_pl = [self[k].to_polars() for k in self]
+        df_pl = pl.concat(dfs_pl, how="diagonal_relaxed")
+
+        # Compute key mapping using polars (much faster than pandas for large datasets)
+        df_pl = df_pl.with_columns(
+            pl.col("labels").rank("dense").cast(pl.Int64).sub(1).alias("key")
+        )
+
+        # Convert to pandas at the end for API compatibility
+        return df_pl.to_pandas()
+
+    @property
+    def label_to_key_array(self) -> ndarray:
+        """
+        Get a numpy array for O(1) label-to-key lookup.
+
+        This is cached for repeated access during matrix building.
+        Uses numpy fancy indexing which is faster than pandas .map()
+        for large datasets.
+
+        The array has shape (max_label + 1,) where array[label] = key.
+        Labels not present in constraints map to -1.
+
+        Returns
+        -------
+        np.ndarray
+            Array mapping label indices to compact key indices.
+        """
+        if self._label_to_key_array is None:
+            flat = self.flat
+            if len(flat) == 0:
+                self._label_to_key_array = np.array([], dtype=np.int64)
+            else:
+                max_label = flat["labels"].max()
+                mapping = np.full(max_label + 1, -1, dtype=np.int64)
+                mapping[flat["labels"].values] = flat["key"].values
+                self._label_to_key_array = mapping
+        return self._label_to_key_array
 
     def to_matrix(self, filter_missings: bool = True) -> scipy.sparse.csc_matrix:
         """
@@ -1082,16 +1171,19 @@ class Constraints:
             raise ValueError("No constraints available to convert to matrix.")
 
         if filter_missings:
-            vars = self.model.variables.flat
-            shape = (cons.key.max() + 1, vars.key.max() + 1)
-            cons["vars"] = cons.vars.map(vars.set_index("labels").key)
+            # Use cached numpy array for O(1) label-to-key lookup instead of
+            # pandas .map() which has O(n log n) overhead
+            label_to_key = self.model.variables.label_to_key_array
+            var_keys = label_to_key[cons["vars"].values]
+            shape = (cons["key"].max() + 1, len(label_to_key))
             return scipy.sparse.csc_matrix(
-                (cons.coeffs, (cons.key, cons.vars)), shape=shape
+                (cons["coeffs"].values, (cons["key"].values, var_keys)), shape=shape
             )
         else:
             shape = self.model.shape
             return scipy.sparse.csc_matrix(
-                (cons.coeffs, (cons.labels, cons.vars)), shape=shape
+                (cons["coeffs"].values, (cons["labels"].values, cons["vars"].values)),
+                shape=shape,
             )
 
     def reset_dual(self) -> None:

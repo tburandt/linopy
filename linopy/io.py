@@ -5,6 +5,7 @@ Module containing all import/export functionalities.
 
 from __future__ import annotations
 
+import io
 import logging
 import shutil
 import time
@@ -395,6 +396,7 @@ def constraints_to_file(
     lazy: bool = False,
     slice_size: int = 2_000_000,
     explicit_coordinate_names: bool = False,
+    buffer_size: int = 1024 * 1024,  # 1MB buffer
 ) -> None:
     if not len(m.constraints):
         return
@@ -411,6 +413,9 @@ def constraints_to_file(
             desc="Writing constraints.",
             colour=TQDM_COLOR,
         )
+
+    # Use intermediate buffer to reduce write syscalls
+    buffer = io.BytesIO()
 
     # to make this even faster, we can use polars expression
     # https://docs.pola.rs/user-guide/expressions/plugins/#output-data-types
@@ -474,12 +479,16 @@ def constraints_to_file(
                 separator=" ", null_value="", quote_style="never", include_header=False
             )
             formatted = df.select(pl.concat_str(columns, ignore_nulls=True))
-            formatted.write_csv(f, **kwargs)
+            formatted.write_csv(buffer, **kwargs)
 
-            # in the future, we could use lazy dataframes when they support appending
-            # tp existent files
-            # formatted = df.lazy().select(pl.concat_str(columns, ignore_nulls=True))
-            # formatted.sink_csv(f,  **kwargs)
+            # Flush buffer to file when it exceeds buffer_size
+            if buffer.tell() >= buffer_size:
+                f.write(buffer.getvalue())
+                buffer = io.BytesIO()
+
+    # Final flush of remaining buffer contents
+    if buffer.tell() > 0:
+        f.write(buffer.getvalue())
 
 
 def to_lp_file(
