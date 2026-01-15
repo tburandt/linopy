@@ -1566,8 +1566,8 @@ class LinearExpression(BaseExpression):
         Create a LinearExpression from a list of lists with different lengths.
         """
         shape = list(map(len, coords.values()))
+        n_exprs = len(exprs)
 
-        coeffs = array(tuple(zip_longest(*(e.coeffs for e in exprs), fillvalue=nan)))
         if n_exprs == 0:
             # Handle empty case
             coeffdata = DataArray(
