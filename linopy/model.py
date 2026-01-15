@@ -1291,9 +1291,14 @@ class Model:
 
         try:
             solver_class = getattr(solvers, f"{solvers.SolverName(solver_name).name}")
-            # initialize the solver as object of solver subclass <solver_class>
+            
+            # Filter out linopy-specific options that should not be passed to solver
+            linopy_options = {"explicit_coordinate_names"}
+            filtered_solver_options = {
+                k: v for k, v in solver_options.items() if k not in linopy_options
+            }
             solver = solver_class(
-                **solver_options,
+                **filtered_solver_options,
             )
             if io_api == "direct":
                 # no problem file written and direct model is set for solver
